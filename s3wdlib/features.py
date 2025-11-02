@@ -6,7 +6,30 @@ from sklearn.feature_selection import mutual_info_classif
 
 def rank_features_mi(X: pd.DataFrame, y, method="mi"):
     Xv = X.values; yv = np.asarray(y, int)
+<<<<<<< HEAD
     mi = mutual_info_classif(Xv, yv, discrete_features=False, random_state=42)
+=======
+
+    cat_feats = []
+    if hasattr(X, "attrs"):
+        attr_val = X.attrs.get("categorical_features")
+        if attr_val is not None:
+            if isinstance(attr_val, (list, tuple, pd.Index, np.ndarray)):
+                cat_feats = list(attr_val)
+            else:
+                cat_feats = [attr_val]
+
+    discrete_features = False
+    if cat_feats:
+        cat_set = set(cat_feats)
+        mask = [col in cat_set for col in X.columns]
+        if all(mask):
+            discrete_features = True
+        elif any(mask):
+            discrete_features = np.asarray(mask)
+
+    mi = mutual_info_classif(Xv, yv, discrete_features=discrete_features, random_state=42)
+>>>>>>> e6237f82eef4821a7d90f039e6e24b30c7bd79d2
     order = np.argsort(-mi)
     feat_names = X.columns.to_list()
     ranked = [feat_names[i] for i in order]
