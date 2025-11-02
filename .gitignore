@@ -2,7 +2,3 @@ data/
 .ipynb_checkpoints/
 __pycache__/
 *.log
-*.npz
-*.npy
-*.pt
-*.pth

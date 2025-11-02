@@ -1,0 +1,36 @@
+# === 数据集与标签 ===
+DATA_PATH: "./data/winequality-red.csv"
+CONT_LABEL: "quality"         # 连续标签列
+CONT_THRESH: 6                # ≥6 记为正类
+CONT_OP: ">="
+
+# === 划分比例 ===
+TEST_SIZE: 0.30               # 外层 70/30
+VAL_SIZE: 0.30                # 训练子集再切验证
+SEED: 42
+
+# === 特征分层（互信息排序 + 60/80/100）===
+LEVEL_PCTS: [0.6, 0.8, 1.0]
+RANKER: "mi"                  # mi=互信息；simple=方差
+
+# === KWB 参数 ===
+KWB_K: 5
+
+# === S3WD（严格按论文）===
+S3_c1: 0.37                   # 信息增益权重占位（保持原文比例）
+S3_c2: 0.63
+S3_xi_min: 0.10               # 仅下限！确保中间层保留样本
+S3_theta_pos: 2.0             # 论文建议 θ_pos > θ_neg
+S3_theta_neg: 1.0
+S3_penalty_large: 1000000.0   # 量纲要大，xi_min 约束才“硬”
+S3_gamma_last: true       # 末层固定二分 γ_n=0.5
+S3_gap: 0.02                  # 仅确保 α>β 的最小间隙（等价于论文 α>β）
+
+# === PSO 超参（标准 PSO）===
+PSO_particles: 24
+PSO_iters: 60
+PSO_w_max: 0.9
+PSO_w_min: 0.4
+PSO_c1: 1.8
+PSO_c2: 1.8
+PSO_seed: 42
