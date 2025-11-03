@@ -175,5 +175,3 @@ def show_cfg(cfg: dict) -> None:
             print(f"- {grp}: {cfg[grp]}")
 
 
-# 向后兼容老接口命名
-load_yaml_cfg = load_config
