@@ -21,14 +21,14 @@ def _normalize_flat_to_grouped(raw: dict) -> dict:
     D["DATA"] = {
         "data_dir": ddir,
         "data_file": dfile,
-        "test_size": raw.get("TEST_SIZE"),
-        "val_size": raw.get("VAL_SIZE"),
-        "random_state": raw.get("RANDOM_STATE"),
+        "continuous_label": raw.get("CONT_LABEL"),
+        "threshold": raw.get("CONT_THRESH"),
+        "threshold_op": raw.get("CONT_OP"),
         "label_col": raw.get("LABEL_COL"),
         "positive_label": raw.get("POSITIVE_LABEL"),
-        "continuous_label": raw.get("CONTINUOUS_LABEL"),
-        "threshold": raw.get("THRESHOLD"),
-        "threshold_op": raw.get("THRESHOLD_OP"),
+        "test_size": raw.get("TEST_SIZE"),
+        "val_size": raw.get("VAL_SIZE"),
+        "random_state": raw.get("SEED"),
     }
 
     # LEVEL
@@ -44,6 +44,18 @@ def _normalize_flat_to_grouped(raw: dict) -> dict:
         "eps": raw.get("KWB_eps", 1e-6),
         "use_faiss": raw.get("KWB_use_faiss", False),
         "faiss_gpu": raw.get("KWB_faiss_gpu", False),
+    }
+
+    # GWB
+    D["GWB"] = {
+        "k": raw.get("GWB_K"),
+        "metric": raw.get("GWB_metric", "euclidean"),
+        "eps": raw.get("GWB_eps", 1e-6),
+        "mode": raw.get("GWB_mode", raw.get("GWB_kernel", "epanechnikov")),
+        "bandwidth": raw.get("GWB_bandwidth"),
+        "bandwidth_scale": raw.get("GWB_bandwidth_scale", 1.0),
+        "use_faiss": raw.get("GWB_use_faiss", False),
+        "faiss_gpu": raw.get("GWB_faiss_gpu", False),
     }
 
     # GWB
@@ -91,9 +103,13 @@ def _require(G: dict, name: str, keys: list[str]):
     if missing:
         raise KeyError(f"{name} 缺少必需键: {missing}")
 
-def load_config(yaml_path: str) -> dict:
-    with open(yaml_path, "r", encoding="utf-8") as f:
+def load_yaml_cfg(path: str) -> dict:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"配置文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"YAML 为空或结构不是字典: {path}")
 
     # 若直接提供了分组则直接使用，否则把扁平键归一化为分组
     if GROUPS & set(raw.keys()):
@@ -107,6 +123,7 @@ def load_config(yaml_path: str) -> dict:
 
     # 严格项校验
     _require(cfg["DATA"], "DATA", ["data_dir","data_file","test_size","val_size","random_state"])
+    # Either continuous or label_col
     has_cont = all(cfg["DATA"].get(x) is not None for x in ["continuous_label","threshold","threshold_op"])
     has_label = all(cfg["DATA"].get(x) is not None for x in ["label_col","positive_label"])
     if not (has_cont or has_label):
@@ -125,9 +142,16 @@ def extract_vars(cfg: dict) -> dict:
     V = {}
     D = cfg["DATA"]
     V["DATA_PATH"] = os.path.join(D["data_dir"], D["data_file"])
-    V["TEST_SIZE"] = D["test_size"]; V["VAL_SIZE"] = D["val_size"]; V["RANDOM_STATE"] = D["random_state"]
-    V["LABEL_COL"] = D["label_col"]; V["POSITIVE_LABEL"] = D["positive_label"]
-    V["CONTINUOUS_LABEL"] = D["continuous_label"]; V["THRESHOLD"] = D["threshold"]; V["THRESHOLD_OP"] = D["threshold_op"]
+    if D.get("continuous_label") is not None:
+        V["CONT_LABEL"] = D["continuous_label"]
+        V["CONT_THRESH"] = D["threshold"]
+        V["CONT_OP"] = D["threshold_op"]
+    if D.get("label_col") is not None:
+        V["LABEL_COL"] = D["label_col"]
+        V["POSITIVE_LABEL"] = D["positive_label"]
+    V["TEST_SIZE"] = D["test_size"]
+    V["VAL_SIZE"] = D["val_size"]
+    V["SEED"] = D["random_state"]
 
     L = cfg["LEVEL"]
     V["LEVEL_PCTS"] = L["level_pcts"]; V["RANKER"] = L["ranker"]
@@ -136,6 +160,16 @@ def extract_vars(cfg: dict) -> dict:
     V["KWB_K"] = K["k"]; V["KWB_metric"] = K["metric"]; V["KWB_eps"] = K["eps"]
     V["KWB_use_faiss"] = K.get("use_faiss", False)
     V["KWB_faiss_gpu"] = K.get("faiss_gpu", False)
+
+    G = cfg["GWB"]
+    V["GWB_K"] = G["k"]
+    V["GWB_metric"] = G["metric"]
+    V["GWB_eps"] = G["eps"]
+    V["GWB_mode"] = G["mode"]
+    V["GWB_bandwidth"] = G["bandwidth"]
+    V["GWB_bandwidth_scale"] = G["bandwidth_scale"]
+    V["GWB_use_faiss"] = G["use_faiss"]
+    V["GWB_faiss_gpu"] = G["faiss_gpu"]
 
     G = cfg["GWB"]
     V["GWB_K"] = G["k"]
@@ -169,5 +203,3 @@ def show_cfg(cfg: dict) -> None:
             print(f"- {grp}: {cfg[grp]}")
 
 
-# 向后兼容老接口命名
-load_yaml_cfg = load_config
