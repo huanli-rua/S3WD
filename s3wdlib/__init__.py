@@ -6,6 +6,8 @@ from .features import rank_features_mi, make_levels
 from .dyn_threshold import adapt_thresholds_rule_based, adapt_thresholds_windowed_pso
 from .drift import DriftDetector, DriftEvent
 from .incremental import PosteriorUpdater, latest_estimator_for_flow
+from .evalx import classification_metrics, batch_metrics, layer_stats
+from .viz import probability_histogram, threshold_trajectory, drift_timeline
 
 __all__ = [
     "load_table_auto",
@@ -18,4 +20,10 @@ __all__ = [
     "DriftEvent",
     "PosteriorUpdater",
     "latest_estimator_for_flow",
+    "classification_metrics",
+    "batch_metrics",
+    "layer_stats",
+    "probability_histogram",
+    "threshold_trajectory",
+    "drift_timeline",
 ]
