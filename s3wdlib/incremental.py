@@ -177,6 +177,28 @@ class PosteriorUpdater:
                 overflow,
             )
 
+        # ==== 修复：类别缓存与样本缓存对齐（先无类→后有类；已有类但本批无类） ====
+        try:
+            X_arr = locals().get('X_arr', None)
+            y_arr = locals().get('y_arr', None)
+            cat_arr = locals().get('cat_arr', None)
+            if y_arr is not None:
+                if cat_arr is not None:
+                    import numpy as _np
+                    cat_np = _np.asarray(cat_arr, dtype=object)
+                    if self._buffer_cat is None:
+                        n_old = self._buffer_y.shape[0] - y_arr.shape[0]
+                        pad = _np.full((max(0, n_old), cat_np.shape[1]), '__MISSING__', dtype=object)
+                        self._buffer_cat = _np.concatenate([pad, cat_np], axis=0)
+                    else:
+                        self._buffer_cat = _np.concatenate([self._buffer_cat, cat_np], axis=0)
+                elif self._buffer_cat is not None and X_arr is not None:
+                    import numpy as _np
+                    fill = _np.full((X_arr.shape[0], self._buffer_cat.shape[1]), '__MISSING__', dtype=object)
+                    self._buffer_cat = _np.concatenate([self._buffer_cat, fill], axis=0)
+        except Exception as _e:
+            if hasattr(self, '_logger'):
+                self._logger.warning(f"[ingest_sliding] 类别对齐补丁触发异常: {_e}")
     def _ingest_reservoir(
         self,
         X_arr: np.ndarray,
@@ -288,11 +310,50 @@ class PosteriorUpdater:
             return False
 
     # ------------------------------------------------------------------
+        # ==== 修复：FAISS 追加时的类别矩阵行数对齐 ====
+        try:
+            estimator = locals().get('estimator', None)
+            y_arr = locals().get('y_arr', None)
+            cat_arr = locals().get('cat_arr', None)
+            if estimator is not None and hasattr(estimator, 'y_tr'):
+                import numpy as _np
+                if hasattr(estimator, '_cat_tr'):
+                    if cat_arr is not None:
+                        cat_np = _np.asarray(cat_arr, dtype=object)
+                        if getattr(estimator, '_cat_tr', None) is None:
+                            n_old = estimator.y_tr.shape[0] - (0 if y_arr is None else y_arr.shape[0])
+                            pad = _np.full((max(0, n_old), cat_np.shape[1]), '__MISSING__', dtype=object)
+                            estimator._cat_tr = _np.concatenate([pad, cat_np], axis=0)
+                        else:
+                            estimator._cat_tr = _np.concatenate([estimator._cat_tr, cat_np], axis=0)
+                    elif getattr(estimator, '_cat_tr', None) is not None and y_arr is not None:
+                        fill = _np.full((y_arr.shape[0], estimator._cat_tr.shape[1]), '__MISSING__', dtype=object)
+                        estimator._cat_tr = _np.concatenate([estimator._cat_tr, fill], axis=0)
+        except Exception as _e:
+            if hasattr(self, '_logger'):
+                self._logger.warning(f"[_try_faiss_append] 类别对齐补丁触发异常: {_e}")
     def _rebuild_estimator(self) -> None:
         if self._buffer_X is None or self._buffer_y is None:
             return
         estimator = self.estimator_factory()
         if self._buffer_cat is not None:
+        # ==== 修复：重建前的类别缓存行数兜底对齐 ====
+        try:
+            if getattr(self, '_buffer_cat', None) is not None:
+                import numpy as _np
+                n_y = self._buffer_y.shape[0]
+                n_c = self._buffer_cat.shape[0]
+                if n_c != n_y:
+                    if n_c < n_y:
+                        need = n_y - n_c
+                        cols = self._buffer_cat.shape[1]
+                        pad = _np.full((need, cols), '__MISSING__', dtype=object)
+                        self._buffer_cat = _np.concatenate([pad, self._buffer_cat], axis=0)
+                    else:
+                        self._buffer_cat = self._buffer_cat[-n_y:]
+        except Exception as _e:
+            if hasattr(self, '_logger'):
+                self._logger.warning(f"[_rebuild_estimator] 类别兜底对齐异常: {_e}")
             estimator.fit(self._buffer_X, self._buffer_y, categorical_values=self._buffer_cat)
         else:
             estimator.fit(self._buffer_X, self._buffer_y)
@@ -335,4 +396,3 @@ def latest_estimator_for_flow(updater: PosteriorUpdater) -> object | None:
     """动态流程入口的便捷函数，返回 `PosteriorUpdater` 当前模型。"""
 
     return updater.current_estimator()
-
