@@ -10,7 +10,7 @@
 
 ## 快速上手
 
-1. 更新 `configs/s3wd_airline.yaml` 至文档所列的 v02 键位。
+1. 准备 `configs/s3wd_airline_v02.yaml`（示例配置已包含 v02 所需键位，可在此基础上调整路径与参数）。
 2. 运行 `notebooks/02_s3wd_gwb.ipynb`，Notebook 会依次完成数据加载、参考元组构建、流式主循环、漂移响应、可视化与 CSV 导出。
 3. 输出文件默认存放于 `DATA.data_dir` 指定目录，包括：
    - `threshold_trace_v02.csv`
