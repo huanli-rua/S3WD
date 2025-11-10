@@ -1,57 +1,64 @@
-# === 数据集与标签（Kaggle Airline: departure delay, minutes）===
-# 请先将 airline.arff 或 airline.csv 放在 ./data/airline/airline.arff（或自行调整路径）
-# 该数据来自 Kaggle「Airline on-time performance」，包含连续列 dep_delay（起飞延误分钟）
-DATA_PATH: "../data/airlines_train_regression_1000000.arff"
+# === S3WD v02 · Airline 参考元组流程示例配置 ===
+# 依旧沿用分组式 YAML，与 `s3wd_airline_dynamic.yaml` 风格保持一致。
+# 若路径与数据名称不同，请在 DATA 段中修改 data_dir/data_file。
 
-# 这是“连续标签二值化”场景：按美国交通部常用标准，延误 > 15 分钟视为正类
-CONT_LABEL: "DepDelay"
-CONT_THRESH: 15
-CONT_OP: ">"
+DATA:
+  data_dir: "../data"
+  data_file: "airlines_train_regression_1000000.arff"
+  continuous_label: "DepDelay"         # 连续延误分钟数
+  threshold: 15                         # 延误 > 15 分钟视为正类
+  threshold_op: ">"
+  test_size: 0.30
+  val_size: 0.30
+  random_state: 42
+  start_year: 2018
 
-# === 划分比例 ===
-TEST_SIZE: 0.30
-VAL_SIZE: 0.30
-SEED: 42
+LEVEL:
+  level_pcts: [0.6, 0.8, 1.0]
+  ranker: "mi"
 
-# === 特征分层（互信息排序 + 60/80/100）===
-LEVEL_PCTS: [0.6, 0.8, 1.0]
-RANKER: "mi"
+KWB:
+  k: 6
+  metric: "euclidean"
+  eps: 1.0e-6
+  use_faiss: true
+  faiss_gpu: true
 
-# === KWB 参数 ===
-KWB_K: 6
-KWB_use_faiss: true            # 是否启用 FAISS 加速后验（环境不支持时自动降级）
-KWB_faiss_gpu: true            # 是否使用 GPU 版 FAISS（自动检测可用 GPU）
-# === GWB 参数 ===
-GWB_K: 6
-GWB_mode: "epanechnikov"     # mode: gaussian | epanechnikov | triangular | exponential
-GWB_bandwidth: 0.8            # 带宽 h：特征已缩放到[0,1]时可先尝试 0.5~1.0
-GWB_use_faiss: true           # 是否启用 FAISS（若环境不支持会自动降级并提示）
-GWB_faiss_gpu: true           # 是否将 FAISS 推到 GPU（自动检测可用 GPU）
+GWB:
+  k: 10
+  metric: "euclidean"
+  eps: 1.0e-6
+  mode: "epanechnikov"
+  bandwidth: 0.72
+  bandwidth_scale: 1.05
+  use_faiss: true
+  faiss_gpu: true
+  categorical_features: ["Origin", "Dest"]
+  category_penalty: 0.30
 
-# === S3WD（严格按论文）===
-S3_c1: 0.37
-S3_c2: 0.63
-S3_xi_min: 0.10
-S3_theta_pos: 0.9
-S3_theta_neg: 0.1
-S3_penalty_large: 1000000.0
-S3_gamma_last: true
-S3_gap: 0.02
-S3_sigma: 3.0                 # 后悔厌恶系数
-S3_regret_mode: utility       # 新增：utility 或 rate
+S3WD:
+  c1: 0.37
+  c2: 0.63
+  xi_min: 0.10
+  theta_pos: 0.90
+  theta_neg: 0.10
+  sigma: 3.0
+  regret_mode: "utility"
+  penalty_large: 1000000.0
+  gamma_last: true
+  gap: 0.02
 
-# === PSO 超参 ===
-# PSO算法的参数配置
-PSO_particles: 20    # 粒子群中粒子的数量
-PSO_iters: 20       # 粒子群算法的最大迭代次数
-PSO_w_max: 0.9       # 惯性权重的最大值
-PSO_w_min: 0.4       # 惯性权重的最小值
-PSO_c1: 2.8          # 个体学习因子（认知参数）
-PSO_c2: 1.3          # 社会学习因子（社会参数）
-PSO_seed: 42         # 随机数生成器的种子值，用于保证实验可重复性
-PSO_use_gpu: true    # 是否在 GPU 上运行 PSO（依赖 CuPy，自动检测环境）
+PSO:
+  particles: 20
+  iters: 20
+  w_max: 0.90
+  w_min: 0.40
+  c1: 2.80
+  c2: 1.30
+  seed: 42
+  use_gpu: true
 
-# === v02 · 分桶 / 参考元组 / 相似度 / 阈值 ===
+# === v02 扩展分组：分桶 / 参考元组 / 相似度 / 阈值 / 平滑 / 漂移 / 开关 ===
 BUCKET:
   keys: [UniqueCarrier, Origin, Dest, dep_hour]
   min_bucket: 500
@@ -81,7 +88,7 @@ SMOOTH:
   step_cap: {alpha: 0.08, beta: 0.08}
 
 DRIFT:
-  method: kswin
+  method: "kswin"
   window_size: 512
   stat_size: 128
   psi_thresholds: {warn: 0.1, alert: 0.25}
