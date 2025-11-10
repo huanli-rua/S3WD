@@ -1,0 +1,111 @@
+# === S3WD v02 · Airline 参考元组流程示例配置 ===
+# 依旧沿用分组式 YAML，与 `s3wd_airline_dynamic.yaml` 风格保持一致。
+# 若路径与数据名称不同，请在 DATA 段中修改 data_dir/data_file。
+
+DATA:
+  data_dir: "../data"
+  data_file: "airlines_train_regression_1000000.arff"
+  continuous_label: "DepDelay"         # 连续延误分钟数
+  threshold: 15                         # 延误 > 15 分钟视为正类
+  threshold_op: ">"
+  test_size: 0.30
+  val_size: 0.30
+  random_state: 42
+  start_year: 2018
+
+LEVEL:
+  level_pcts: [0.6, 0.8, 1.0]
+  ranker: "mi"
+
+KWB:
+  k: 6
+  metric: "euclidean"
+  eps: 1.0e-6
+  use_faiss: true
+  faiss_gpu: true
+
+GWB:
+  k: 10
+  metric: "euclidean"
+  eps: 1.0e-6
+  mode: "epanechnikov"
+  bandwidth: 0.72
+  bandwidth_scale: 1.05
+  use_faiss: true
+  faiss_gpu: true
+  categorical_features: ["Origin", "Dest"]
+  category_penalty: 0.30
+
+S3WD:
+  c1: 0.37
+  c2: 0.63
+  xi_min: 0.10
+  theta_pos: 0.90
+  theta_neg: 0.10
+  sigma: 3.0
+  regret_mode: "utility"
+  penalty_large: 1000000.0
+  gamma_last: true
+  gap: 0.02
+
+PSO:
+  particles: 20
+  iters: 20
+  w_max: 0.90
+  w_min: 0.40
+  c1: 2.80
+  c2: 1.30
+  seed: 42
+  use_gpu: true
+
+# === v02 扩展分组：分桶 / 参考元组 / 相似度 / 阈值 / 平滑 / 漂移 / 开关 ===
+BUCKET:
+  keys: [UniqueCarrier, Origin, Dest, dep_hour]
+  min_bucket: 500
+  backoff: [[UniqueCarrier, Origin, Dest], [Origin, Dest], [Origin]]
+
+REF_TUPLE:
+  topk_per_class: 256
+  pos_quantile: 0.7
+  keep_history_ratio: 0.3
+  use_gwb_weight: true
+
+SIMILARITY:
+  kernel: rbf
+  sigma: 0.5
+  cat_weights: {carrier: 0.4, origin: 0.2, dest: 0.2, dow: 0.1, month: 0.1}
+  combine: product
+  mix_alpha: 0.7
+
+MEASURE:
+  objective: expected_cost
+  costs: {c_fn: 1.0, c_fp: 0.4, c_bnd: 0.2}
+  grid: {alpha: [0.55, 0.9, 0.02], beta: [0.05, 0.45, 0.02]}
+  constraints: {keep_gap: 0.05, min_pos_coverage: 0.02, bnd_cap: 0.35}
+
+SMOOTH:
+  ema_alpha: 0.6
+  step_cap: {alpha: 0.08, beta: 0.08}
+
+DRIFT:
+  method: "kswin"
+  window_size: 512
+  stat_size: 128
+  psi_thresholds: {warn: 0.1, alert: 0.25}
+  tv_thresholds: {warn: 0.1, alert: 0.2}
+  posrate_shift: {warn: 0.05, alert: 0.10}
+  perf_drop: {warn: 0.10, alert: 0.20}
+  debounce_windows: 3
+  actions:
+    S1: {sigma_factor: [1.2, 0.85], redo_threshold: true}
+    S2: {rebuild_ref_tuple: true, keep_history_ratio: 0.3, redo_threshold: true}
+    S3:
+      rebuild_ref_tuple: true
+      rebuild_gwb_index: true
+      keep_history_ratio: 0.3
+      tighten: {keep_gap: 0.08, bnd_cap: 0.25, step_cap: 0.05}
+      cooldown_windows: 3
+
+SWITCH:
+  enable_ref_tuple: true
+  enable_pso: false
