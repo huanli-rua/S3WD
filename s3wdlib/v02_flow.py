@@ -58,6 +58,7 @@ class SeasonalSamples:
     buckets: np.ndarray
     gwb_prob: Optional[np.ndarray]
     weight: np.ndarray
+    source_detail: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -123,8 +124,8 @@ class SeasonalReservoir:
 
     def gather(self, period: pd.Period) -> SeasonalSamples | None:
         month = int(period.month)
-        records = [r for r in self.history_by_month.get(month, []) if r.period < period]
-        records.sort(key=lambda r: r.period)
+        same_month_records = [r for r in self.history_by_month.get(month, []) if r.period < period]
+        same_month_records.sort(key=lambda r: r.period)
         if self.recent_windows > 0:
             extras: List[WindowRecord] = []
             for record in reversed(self.global_history):
@@ -135,8 +136,11 @@ class SeasonalReservoir:
                 extras.append(record)
                 if len(extras) >= self.recent_windows:
                     break
-            records.extend(reversed(extras))
+            extras = list(reversed(extras))
+        else:
+            extras = []
 
+        records = same_month_records + extras
         if not records:
             return None
 
@@ -146,7 +150,7 @@ class SeasonalReservoir:
         gwb_parts: List[np.ndarray] = []
         weight_parts: List[np.ndarray] = []
 
-        same_month_periods = [r.period for r in records if int(r.period.month) == month]
+        same_month_periods = [r.period for r in same_month_records]
         newest_same_month = max(same_month_periods) if same_month_periods else None
         for idx, record in enumerate(records):
             base_weight = self._weights_for_record(record, period, idx, newest_same_month)
@@ -162,7 +166,14 @@ class SeasonalReservoir:
         bucket_all = np.concatenate(bucket_parts)
         weight_all = np.concatenate(weight_parts)
         gwb_all = np.concatenate(gwb_parts) if gwb_parts else None
-        return SeasonalSamples(X_all, y_all, bucket_all, gwb_all, weight_all)
+        detail = {
+            "same_month_windows": [_period_to_str(p) for p in same_month_periods],
+            "same_month_years": sorted({int(p.year) for p in same_month_periods}),
+            "same_month_samples": int(sum(len(r.y) for r in same_month_records)),
+            "neighbor_windows": [_period_to_str(r.period) for r in extras],
+            "neighbor_samples": int(sum(len(r.y) for r in extras)),
+        }
+        return SeasonalSamples(X_all, y_all, bucket_all, gwb_all, weight_all, detail)
 
     def _weights_for_record(
         self,
@@ -371,6 +382,18 @@ def run_streaming_flow(
     data_dir = Path(cfg["DATA"]["data_dir"]).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    time_cfg = cfg.get("TIME", {}) or {}
+    split_mode = str(time_cfg.get("split", "year_month"))
+    if split_mode != "year_month":
+        raise ValueError("TIME.split 必须为 'year_month'，以保证窗口按年-月前滚。")
+
+    val_cfg = cfg.get("VAL", {}) or {}
+    inline_delay = bool(val_cfg.get("inline_delay", True))
+    if not inline_delay:
+        _logger.warning("VAL.inline_delay=false 将导致验证混入历史样本，请确认需求。")
+    else:
+        _logger.info("【验证阶段】VAL.inline_delay=true → 当前月评估仅使用延迟到达的标注。")
+
     bucket_configure(cfg.get("BUCKET"))
     similarity_configure(cfg.get("SIMILARITY"))
     sim_cfg = similarity_current_config()
@@ -386,19 +409,15 @@ def run_streaming_flow(
     X_enriched = _ensure_year_month(X_enriched)
 
     warmup_periods, stream_periods = _prepare_windows(X_enriched, warmup_span)
+    warmup_labels = [_period_to_str(p) for p in warmup_periods]
+    stream_labels = [_period_to_str(p) for p in stream_periods]
     if not stream_periods:
         raise RuntimeError("流式窗口不足，请调整 FLOW.warmup_windows。")
 
     _logger.info(
         "【初始化】warmup=%s，stream=%s，总窗口=%d",
-        [
-            _period_to_str(p)
-            for p in warmup_periods
-        ],
-        [
-            _period_to_str(p)
-            for p in stream_periods
-        ],
+        warmup_labels,
+        stream_labels,
         len(warmup_periods) + len(stream_periods),
     )
 
@@ -580,6 +599,22 @@ def run_streaming_flow(
             _logger.warning("窗口 %s 缺少历史示范，跳过。", _period_to_str(period))
             continue
 
+        detail = seasonal_samples.source_detail or {}
+        same_windows = detail.get("same_month_windows") or []
+        neighbor_windows = detail.get("neighbor_windows") or []
+        same_years = detail.get("same_month_years") or []
+        same_samples = detail.get("same_month_samples", 0)
+        neighbor_samples = detail.get("neighbor_samples", 0)
+        _logger.info(
+            "【参考库】year-month=%s；同月历史窗口=%s（年份=%s，样本=%d）；邻近窗口=%s（样本=%d）；历史仅用于构建Γ/Ψ候选，不混入当月评估",
+            _period_to_str(period),
+            "、".join(same_windows) if same_windows else "无",
+            "、".join(str(y) for y in same_years) if same_years else "无",
+            same_samples,
+            "、".join(neighbor_windows) if neighbor_windows else "无",
+            neighbor_samples,
+        )
+
         ref_tuples = build_ref_tuples(
             seasonal_samples.X,
             seasonal_samples.y,
@@ -744,7 +779,7 @@ def run_streaming_flow(
         delta_alpha = float("nan") if alpha_prev is None else abs(stats["alpha_smooth"] - alpha_prev)
         delta_beta = float("nan") if beta_prev is None else abs(stats["beta_smooth"] - beta_prev)
         _logger.info(
-            "【阈值】alpha*=%0.3f,beta*=%0.3f → α_t=%0.3f/β_t=%0.3f；Δα=%0.3f；Δβ=%0.3f；BND占比=%0.3f；POS覆盖=%0.3f；目标值=%0.4f；σ=%0.3f；约束=%s",
+            "【阈值】alpha*=%0.3f,beta*=%0.3f → α_t=%0.3f/β_t=%0.3f；Δα=%0.3f；Δβ=%0.3f；BND占比=%0.3f；POS覆盖=%0.3f；objective=%s；score=%0.4f；σ=%0.3f；约束=%s",
             stats["alpha_star"],
             stats["beta_star"],
             stats["alpha_smooth"],
@@ -753,6 +788,7 @@ def run_streaming_flow(
             delta_beta,
             stats["bnd_ratio"],
             stats["pos_cov"],
+            objective,
             stats["score"],
             float(runtime_state.get("sigma", 0.0)),
             stats.get("constraint_note") or stats.get("constraint_resolution"),
@@ -783,11 +819,21 @@ def run_streaming_flow(
         if runtime_state.get("rebuild_gwb_index"):
             actions_taken.append("重建GWB")
 
+        canonical_label = ""
         if drift_level != "NONE":
+            canonical_actions: List[str] = []
+            if drift_level in {"S1", "S3"}:
+                canonical_actions.append("调σ")
+            if drift_level in {"S2", "S3"}:
+                canonical_actions.append("重建ΓΨ")
+            if drift_level == "S3":
+                canonical_actions.append("紧护栏")
+                canonical_actions.append("重建GWB")
+            canonical_label = "、".join(canonical_actions) if canonical_actions else "观察"
             _logger.info(
-                "【漂移】级别=%s；动作=%s；作用域=参考/示范/后续月度",
+                "【漂移】级别=%s；动作=%s；生效范围=ref/next（当月评估保持当前样本）",
                 drift_level,
-                "、".join(actions_taken) if actions_taken else "观察",
+                canonical_label,
             )
 
         if runtime_state.get("redo_threshold"):
@@ -885,7 +931,7 @@ def run_streaming_flow(
                     "tv": float(tv_val),
                     "posrate_gap": float(posrate_gap),
                     "perf_drop": float(stats["perf_drop"]),
-                    "actions": "、".join(actions_taken) if actions_taken else "观察",
+                    "actions": canonical_label or ("、".join(actions_taken) if actions_taken else "观察"),
                 }
             )
 
@@ -934,6 +980,7 @@ def run_streaming_flow(
             "drift_events": drift_df,
             "metrics_by_year": metrics_by_year,
             "yearly_metrics": metrics_by_year,
+            "window_order": {"warmup": warmup_labels, "stream": stream_labels},
         }
 
     def _weighted_average(values: pd.Series, weights: Optional[pd.Series]) -> float:
@@ -987,6 +1034,7 @@ def run_streaming_flow(
         "drift_events": drift_df,
         "metrics_by_year": metrics_by_year,
         "yearly_metrics": metrics_by_year,
+        "window_order": {"warmup": warmup_labels, "stream": stream_labels},
     }
 
 

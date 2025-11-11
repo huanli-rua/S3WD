@@ -20,6 +20,8 @@ OPTIONAL_GROUPS = {
     "SMOOTH",
     "SWITCH",
     "FLOW",
+    "TIME",
+    "VAL",
 }
 GROUPS = REQUIRED_GROUPS | OPTIONAL_GROUPS
 
@@ -52,6 +54,12 @@ V02_DEFAULTS = {
     "SMOOTH": {
         "ema_alpha": 0.6,
         "step_cap": {"alpha": 0.08, "beta": 0.08},
+    },
+    "TIME": {
+        "split": "year_month",
+    },
+    "VAL": {
+        "inline_delay": True,
     },
     "DRIFT": {
         "method": "kswin",
@@ -433,6 +441,14 @@ def extract_vars(cfg: dict) -> dict:
         V["SMOOTH_ema_alpha"] = Sm.get("ema_alpha")
         V["SMOOTH_step_cap"] = Sm.get("step_cap")
 
+    if "TIME" in cfg:
+        T = cfg["TIME"]
+        V["TIME_split"] = T.get("split")
+
+    if "VAL" in cfg:
+        val_cfg = cfg["VAL"]
+        V["VAL_inline_delay"] = val_cfg.get("inline_delay")
+
     if "SWITCH" in cfg:
         Sw = cfg["SWITCH"]
         V["SWITCH_enable_ref_tuple"] = Sw.get("enable_ref_tuple")
@@ -458,6 +474,8 @@ def show_cfg(cfg: dict) -> None:
         "DRIFT",
         "INCR",
         "FLOW",
+        "TIME",
+        "VAL",
     ]:
         if grp in cfg:
             print(f"- {grp}: {cfg[grp]}")
