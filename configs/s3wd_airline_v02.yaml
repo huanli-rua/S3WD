@@ -13,6 +13,12 @@ DATA:
   random_state: 42
   start_year: 2018
 
+TIME:
+  split: "year_month"
+
+VAL:
+  inline_delay: true
+
 LEVEL:
   level_pcts: [0.6, 0.8, 1.0]
   ranker: "mi"
