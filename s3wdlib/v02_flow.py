@@ -146,9 +146,10 @@ class SeasonalReservoir:
         gwb_parts: List[np.ndarray] = []
         weight_parts: List[np.ndarray] = []
 
-        newest_period = max(r.period for r in records)
+        same_month_periods = [r.period for r in records if int(r.period.month) == month]
+        newest_same_month = max(same_month_periods) if same_month_periods else None
         for idx, record in enumerate(records):
-            base_weight = self._weights_for_record(record, period, idx, newest_period)
+            base_weight = self._weights_for_record(record, period, idx, newest_same_month)
             X_parts.append(record.X)
             y_parts.append(record.y)
             bucket_parts.append(record.buckets)
@@ -168,7 +169,7 @@ class SeasonalReservoir:
         record: WindowRecord,
         current_period: pd.Period,
         rank: int,
-        newest_period: pd.Period,
+        newest_same_month: Optional[pd.Period],
     ) -> np.ndarray:
         months_diff = max(int(current_period - record.period), 1)
         w_time = math.exp(-self.time_decay * (months_diff - 1))
@@ -181,9 +182,12 @@ class SeasonalReservoir:
         else:
             w_season = self.seasonal_other
         keep_factor = 1.0
-        if record.period.month == current_period.month:
+        if (
+            record.period.month == current_period.month
+            and newest_same_month is not None
+        ):
             # 越旧的同月样本按 keep_history_ratio 衰减
-            delta = int(newest_period - record.period)
+            delta = int(newest_same_month - record.period)
             keep_factor = self.keep_history_ratio ** max(0, delta)
         w_base = w_time * w_season * keep_factor * self.drift_multiplier
 
@@ -296,6 +300,33 @@ def _build_figures(metrics_by_year: pd.DataFrame, output_dir: Path) -> None:
         fig_path = output_dir / f"metric_{metric.lower()}_by_year.png"
         fig.savefig(fig_path, dpi=150)
         plt.close(fig)
+
+
+def _normalize_grid_range(entry: Optional[List[float] | Tuple[float, ...]], default: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """标准化阈值网格范围配置。"""
+
+    if entry is None:
+        entry = default
+    if len(entry) != 3:
+        raise ValueError("阈值网格配置需包含 [start, end, step] 三个数值。")
+    start, end, step = float(entry[0]), float(entry[1]), float(entry[2])
+    if step <= 0:
+        raise ValueError("阈值网格 step 必须为正数。")
+    if end < start:
+        start, end = end, start
+    return start, end, step
+
+
+def _limit_grid_range(base_range: Tuple[float, float, float], center: Optional[float], radius: float) -> Tuple[float, float, float]:
+    """将网格范围限制到以 `center` 为中心的步长约束内。"""
+
+    if center is None or radius <= 0:
+        return base_range
+    low = max(base_range[0], center - radius)
+    high = min(base_range[1], center + radius)
+    if high < low:
+        low = high = max(min(center, base_range[1]), base_range[0])
+    return low, high, base_range[2]
 
 
 def run_streaming_flow(
@@ -449,7 +480,13 @@ def run_streaming_flow(
     )
     P_warm = to_trisect_probs(E_pos_warm, E_neg_warm)
     objective = cfg["MEASURE"].get("objective", "expected_cost")
-    measure_grid = cfg["MEASURE"].get("grid", {"alpha": [0.55, 0.9, 0.02], "beta": [0.05, 0.45, 0.02]})
+    raw_grid = cfg["MEASURE"].get("grid", {"alpha": [0.55, 0.9, 0.02], "beta": [0.05, 0.45, 0.02]})
+    alpha_range_cfg = _normalize_grid_range(raw_grid.get("alpha"), (0.55, 0.9, 0.02))
+    beta_range_cfg = _normalize_grid_range(raw_grid.get("beta"), (0.05, 0.45, 0.02))
+    measure_grid = {
+        "alpha": list(alpha_range_cfg),
+        "beta": list(beta_range_cfg),
+    }
     measure_constraints = cfg["MEASURE"].get("constraints", {})
     measure_costs = cfg["MEASURE"].get("costs", {})
     beta_weight = cfg["MEASURE"].get("beta_weight", 1.0)
@@ -565,21 +602,80 @@ def run_streaming_flow(
                 costs=measure_costs,
                 beta_weight=beta_weight,
             )
+
             step_caps = runtime_state.get("step_cap", {"alpha": 0.08, "beta": 0.08})
-            alpha_smooth, beta_smooth = ema_clip(
-                alpha_star,
-                beta_star,
-                alpha_prev,
-                beta_prev,
-                ema_alpha_coeff,
-                step_caps.get("alpha", 0.08),
-                step_caps.get("beta", 0.08),
-            )
+            alpha_cap = float(step_caps.get("alpha", 0.08))
+            beta_cap = float(step_caps.get("beta", 0.08))
+
+            def _evaluate(alpha_val: float, beta_val: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+                pos_mask, neg_mask, bnd_mask = compute_region_masks(P_block, alpha_val, beta_val)
+                pos_cov_val = float(pos_mask.mean())
+                bnd_ratio_val = float(bnd_mask.mean())
+                return pos_mask, neg_mask, bnd_mask, pos_cov_val, bnd_ratio_val
+
             if alpha_prev is None or beta_prev is None:
                 alpha_smooth, beta_smooth = alpha_star, beta_star
-            positive, negative, boundary = compute_region_masks(P_block, alpha_smooth, beta_smooth)
-            pos_cov = float(positive.mean())
-            bnd_ratio = float(boundary.mean())
+            else:
+                alpha_smooth, beta_smooth = ema_clip(
+                    alpha_star,
+                    beta_star,
+                    alpha_prev,
+                    beta_prev,
+                    ema_alpha_coeff,
+                    alpha_cap,
+                    beta_cap,
+                )
+
+            positive, negative, boundary, pos_cov, bnd_ratio = _evaluate(alpha_smooth, beta_smooth)
+
+            constraint_cfg = runtime_state.get("constraints", {})
+            min_pos_cov = float(constraint_cfg.get("min_pos_coverage", 0.0))
+            bnd_cap = float(constraint_cfg.get("bnd_cap", 1.0))
+            constraint_causes: List[str] = []
+            if pos_cov < min_pos_cov:
+                constraint_causes.append("POS<min_pos_coverage")
+            if bnd_ratio > bnd_cap:
+                constraint_causes.append("BND>bnd_cap")
+            constraint_note = " & ".join(constraint_causes)
+            constraint_resolution = "满足约束"
+
+            if constraint_causes and alpha_prev is not None and beta_prev is not None:
+                limited_alpha = _limit_grid_range(alpha_range_cfg, alpha_prev, alpha_cap)
+                limited_beta = _limit_grid_range(beta_range_cfg, beta_prev, beta_cap)
+                limited_grid = {"alpha": list(limited_alpha), "beta": list(limited_beta)}
+                alt_alpha, alt_beta, _ = select_alpha_beta(
+                    P_block,
+                    limited_grid,
+                    runtime_state["constraints"],
+                    objective=objective,
+                    costs=measure_costs,
+                    beta_weight=beta_weight,
+                )
+                alt_pos, alt_neg, alt_bnd, alt_cov, alt_ratio = _evaluate(alt_alpha, alt_beta)
+                if alt_cov >= min_pos_cov and alt_ratio <= bnd_cap:
+                    alpha_smooth, beta_smooth = alt_alpha, alt_beta
+                    positive, negative, boundary = alt_pos, alt_neg, alt_bnd
+                    pos_cov, bnd_ratio = alt_cov, alt_ratio
+                    constraint_resolution = "步长网格重算"
+                    if constraint_note:
+                        constraint_note = f"{constraint_note} → {constraint_resolution}"
+                    constraint_causes = []
+                else:
+                    alpha_smooth, beta_smooth = alpha_prev, beta_prev
+                    positive, negative, boundary, pos_cov, bnd_ratio = _evaluate(alpha_smooth, beta_smooth)
+                    constraint_resolution = "回退上月阈值"
+                    if constraint_note:
+                        constraint_note = f"{constraint_note} → {constraint_resolution}"
+                    constraint_causes = []
+            elif constraint_causes:
+                # 首个窗口直接使用网格解即可满足约束
+                alpha_smooth, beta_smooth = alpha_star, beta_star
+                positive, negative, boundary, pos_cov, bnd_ratio = _evaluate(alpha_smooth, beta_smooth)
+                constraint_resolution = "首窗取网格解"
+                if constraint_note:
+                    constraint_note = f"{constraint_note} → {constraint_resolution}"
+                constraint_causes = []
+
             if objective == "expected_cost":
                 score_smoothed = expected_cost(
                     P_block,
@@ -612,6 +708,8 @@ def run_streaming_flow(
                 "bnd_ratio": bnd_ratio,
                 "score": score_smoothed,
                 "perf_drop": perf_drop,
+                "constraint_resolution": constraint_resolution,
+                "constraint_note": constraint_note,
             }
             return positive, boundary, stats
 
@@ -631,7 +729,7 @@ def run_streaming_flow(
         delta_alpha = float("nan") if alpha_prev is None else abs(stats["alpha_smooth"] - alpha_prev)
         delta_beta = float("nan") if beta_prev is None else abs(stats["beta_smooth"] - beta_prev)
         _logger.info(
-            "【阈值】alpha*=%0.3f,beta*=%0.3f → α_t=%0.3f/β_t=%0.3f；Δα=%0.3f；Δβ=%0.3f；BND占比=%0.3f；POS覆盖=%0.3f；目标值=%0.4f；σ=%0.3f",
+            "【阈值】alpha*=%0.3f,beta*=%0.3f → α_t=%0.3f/β_t=%0.3f；Δα=%0.3f；Δβ=%0.3f；BND占比=%0.3f；POS覆盖=%0.3f；目标值=%0.4f；σ=%0.3f；约束=%s",
             stats["alpha_star"],
             stats["beta_star"],
             stats["alpha_smooth"],
@@ -642,6 +740,7 @@ def run_streaming_flow(
             stats["pos_cov"],
             stats["score"],
             float(runtime_state.get("sigma", 0.0)),
+            stats.get("constraint_note") or stats.get("constraint_resolution"),
         )
 
         stats_curr = {
@@ -661,7 +760,6 @@ def run_streaming_flow(
             baseline_info["posrate"] = posrate_curr
             baseline_info["perf"] = stats["score"]
 
-        sigma_after = float(runtime_state.get("sigma", stats_curr["window_id"]))
         actions_taken: List[str] = []
         if runtime_state.get("redo_threshold"):
             actions_taken.append("阈值重算")
@@ -691,6 +789,8 @@ def run_streaming_flow(
                 "objective_score": float(stats["score"]),
                 "bnd_ratio": float(stats["bnd_ratio"]),
                 "pos_coverage": float(stats["pos_cov"]),
+                "constraint_note": stats.get("constraint_note", ""),
+                "constraint_resolution": stats.get("constraint_resolution", ""),
             }
         )
 
@@ -705,6 +805,7 @@ def run_streaming_flow(
                 "bnd_ratio": float(stats["bnd_ratio"]),
                 "alpha": float(stats["alpha_smooth"]),
                 "beta": float(stats["beta_smooth"]),
+                "constraint_resolution": stats.get("constraint_resolution", ""),
             }
         )
 
