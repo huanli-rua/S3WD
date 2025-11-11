@@ -98,6 +98,59 @@ class GWBProbEstimator:
         self.category_penalty = float(np.clip(self.category_penalty, 0.0, 1.0))
         self._cat_tr: np.ndarray | None = None
         self._cat_cols: list[str] = []
+        self._numeric_columns: list[str] | None = None
+        self._n_features: int | None = None
+
+    @staticmethod
+    def _is_pandas_frame(obj) -> bool:
+        """Best-effort detection for pandas-like DataFrame objects."""
+
+        return hasattr(obj, "select_dtypes") and hasattr(obj, "columns")
+
+    def _ensure_numeric_matrix(self, X, *, fit: bool) -> np.ndarray:
+        """Extract the numeric feature matrix while filtering categorical columns."""
+
+        if self._is_pandas_frame(X):
+            df = X
+            drop_cols = list(self.categorical_features or [])
+            if drop_cols:
+                drop_present = [col for col in drop_cols if col in df.columns]
+                if drop_present:
+                    df = df.drop(columns=drop_present)
+            numeric_df = df.select_dtypes(include=["number", "bool"])
+            if fit:
+                self._numeric_columns = list(numeric_df.columns)
+            elif self._numeric_columns is not None:
+                missing = [col for col in self._numeric_columns if col not in numeric_df.columns]
+                if missing:
+                    raise ValueError(
+                        "预测数据缺少在拟合阶段使用的数值特征列: " + ", ".join(missing)
+                    )
+                numeric_df = numeric_df[self._numeric_columns]
+            if numeric_df.shape[1] == 0:
+                raise ValueError("GWBProbEstimator 需要至少一个数值特征列用于距离计算。")
+            arr = np.asarray(numeric_df.to_numpy(), float)
+            if self._n_features is not None and not fit and arr.shape[1] != self._n_features:
+                raise ValueError(
+                    "数值特征维度与拟合阶段不一致：期望 %d，得到 %d"
+                    % (self._n_features, arr.shape[1])
+                )
+            return arr
+
+        try:
+            arr = np.asarray(X, float)
+        except ValueError as exc:
+            raise ValueError(
+                "GWBProbEstimator 仅支持数值特征，请在调用前移除或编码类别列。原始错误: %s"
+                % exc
+            ) from exc
+        if fit:
+            self._numeric_columns = None
+        if self._n_features is not None and not fit and arr.shape[1] != self._n_features:
+            raise ValueError(
+                "数值特征维度与拟合阶段不一致：期望 %d，得到 %d" % (self._n_features, arr.shape[1])
+            )
+        return arr
 
     @staticmethod
     def _normalize_categories(values: np.ndarray) -> np.ndarray:
@@ -160,9 +213,12 @@ class GWBProbEstimator:
         return arr, list(columns) if columns is not None else None
 
     def fit(self, X, y, categorical_values=None):
-        X = np.asarray(X, float)
+        self._numeric_columns = None
+        self._n_features = None
+        X = self._ensure_numeric_matrix(X, fit=True)
         y = np.asarray(y, int)
         n_samples = X.shape[0]
+        self._n_features = X.shape[1]
         self._k_effective = int(min(self.k, max(1, n_samples)))
         self.nn = None
         self._faiss_index = None
@@ -250,7 +306,7 @@ class GWBProbEstimator:
         if self.y_tr is None or self._k_effective is None:
             raise RuntimeError("Estimator must be fitted before calling predict_proba().")
 
-        X = np.asarray(X, float)
+        X = self._ensure_numeric_matrix(X, fit=False)
         if self._use_faiss_runtime:
             if self._faiss_index is None:
                 raise RuntimeError("FAISS 索引未正确初始化。")
