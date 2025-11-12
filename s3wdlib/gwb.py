@@ -353,6 +353,18 @@ class GWBProbEstimator:
         y = np.asarray(y, int)
         n_samples = X.shape[0]
         self._n_features = X.shape[1]
+        if n_samples == 0:
+            # 无训练样本时直接返回并在预测阶段输出均匀概率，避免近邻查询异常。
+            self._k_effective = 0
+            self.nn = None
+            self._faiss_index = None
+            self._faiss_res = None
+            self._use_faiss_runtime = False
+            self.y_tr = np.asarray(y, int)
+            self._cat_tr = None
+            self._cat_cols = []
+            return self
+
         self._k_effective = int(min(self.k, max(1, n_samples)))
         self.nn = None
         self._faiss_index = None
@@ -437,10 +449,20 @@ class GWBProbEstimator:
         return weights * reweight
 
     def predict_proba(self, X, categorical_values=None):
-        if self.y_tr is None or self._k_effective is None:
-            raise RuntimeError("Estimator must be fitted before calling predict_proba().")
+        if (
+            self.y_tr is None
+            or self._k_effective is None
+            or self._k_effective <= 0
+            or self.y_tr.size == 0
+        ):
+            X = self._ensure_numeric_matrix(X, fit=False, categorical_values=categorical_values)
+            if X.shape[0] == 0:
+                return np.array([], dtype=float)
+            return np.full(X.shape[0], 0.5, dtype=float)
 
         X = self._ensure_numeric_matrix(X, fit=False, categorical_values=categorical_values)
+        if X.shape[0] == 0:
+            return np.array([], dtype=float)
         if self._use_faiss_runtime:
             if self._faiss_index is None:
                 raise RuntimeError("FAISS 索引未正确初始化。")
@@ -451,7 +473,14 @@ class GWBProbEstimator:
             if self.nn is None:
                 raise RuntimeError("FAISS 初始化失败且未建立 sklearn 近邻模型。")
             distances, idx = self.nn.kneighbors(X, n_neighbors=self._k_effective, return_distance=True)
+        invalid_mask = idx < 0
+        if np.any(invalid_mask):
+            idx = idx.copy()
+            idx[invalid_mask] = 0
         weights = self._compute_weights(distances)
+        if np.any(invalid_mask):
+            weights = weights.copy()
+            weights[invalid_mask] = 0.0
         if categorical_values is not None or self._cat_tr is not None:
             weights = self._apply_categorical_kernel(weights, idx, categorical_values)
 
