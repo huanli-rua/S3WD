@@ -70,6 +70,17 @@ def format_window_label(value: float) -> str:
 
 
 @dataclass
+class WindowPlan:
+    """定义 warmup/stream 年度窗口计划。"""
+
+    warmup_periods: List[pd.Period]
+    stream_periods: List[pd.Period]
+    warmup_years: List[int]
+    stream_years: List[int]
+    all_years: List[int]
+
+
+@dataclass
 class WindowRecord:
     """缓存单个窗口的特征/标签/预测，用于季节桶增量。"""
 
@@ -339,15 +350,36 @@ def _ensure_year_month(X: pd.DataFrame, start_year: Optional[int] = None) -> pd.
     return X
 
 
-def _prepare_windows(X: pd.DataFrame, warmup_windows: int) -> Tuple[List[pd.Period], List[pd.Period]]:
-    periods = X["period"].unique()
-    periods = sorted(periods)
-    if warmup_windows >= len(periods):
-        warmup = periods[:-1]
+def _prepare_windows(X: pd.DataFrame, warmup_windows: int) -> WindowPlan:
+    periods = sorted(X["period"].unique())
+    years = sorted({int(p.year) for p in periods})
+    if not years:
+        raise RuntimeError("无法根据数据构建窗口年份序列。")
+
+    requested = max(0, int(warmup_windows))
+    if requested == 0:
+        requested = 12
+    warmup_year_count = max(1, math.ceil(requested / 12))
+
+    if warmup_year_count >= len(years):
+        warmup_years = years[:-1]
     else:
-        warmup = periods[:warmup_windows]
-    stream = [p for p in periods if p not in warmup]
-    return warmup, stream
+        warmup_years = years[:warmup_year_count]
+
+    if not warmup_years:
+        warmup_years = [years[0]]
+
+    stream_years = [year for year in years if year not in warmup_years]
+    warmup_periods = [p for p in periods if int(p.year) in warmup_years]
+    stream_periods = [p for p in periods if int(p.year) in stream_years]
+
+    return WindowPlan(
+        warmup_periods=warmup_periods,
+        stream_periods=stream_periods,
+        warmup_years=warmup_years,
+        stream_years=stream_years,
+        all_years=years,
+    )
 
 
 def _period_to_str(period: pd.Period) -> float:
@@ -482,20 +514,30 @@ def run_streaming_flow(
         raise ValueError("数据集中缺少可用于 GWB 估计的数值特征列。")
     X_numeric = X_enriched[numeric_cols]
 
-    warmup_periods, stream_periods = _prepare_windows(X_enriched, warmup_span)
+    window_plan = _prepare_windows(X_enriched, warmup_span)
+    warmup_periods = window_plan.warmup_periods
+    stream_periods = window_plan.stream_periods
+    warmup_years = window_plan.warmup_years
+    stream_years = window_plan.stream_years
+    all_years = window_plan.all_years
     warmup_labels = [_period_to_str(p) for p in warmup_periods]
     stream_labels = [_period_to_str(p) for p in stream_periods]
     warmup_labels_fmt = [format_window_label(val) for val in warmup_labels]
     stream_labels_fmt = [format_window_label(val) for val in stream_labels]
+    warmup_years_fmt = [str(year) for year in warmup_years]
+    stream_years_fmt = [str(year) for year in stream_years]
+    all_years_fmt = [str(year) for year in all_years]
     if not stream_periods:
         raise RuntimeError("流式窗口不足，请调整 FLOW.warmup_windows。")
 
     _logger.info(
-        "【初始化】warmup=%s，stream=%s，总窗口=%d",
+        "【初始化】warmup(月)=%s，stream(月)=%s，总窗口=%d",
         warmup_labels_fmt,
         stream_labels_fmt,
         len(warmup_periods) + len(stream_periods),
     )
+    _logger.info("【窗口计划】年度顺序=%s", all_years_fmt)
+    _logger.info("【窗口计划】warmup(年)=%s，stream(年)=%s", warmup_years_fmt, stream_years_fmt)
 
     warmup_mask = X_enriched["period"].isin(warmup_periods)
     X_warm = X_enriched.loc[warmup_mask].reset_index(drop=True)
@@ -1148,7 +1190,13 @@ def run_streaming_flow(
             "drift_events": drift_df,
             "metrics_by_year": metrics_by_year,
             "yearly_metrics": metrics_by_year,
-            "window_order": {"warmup": warmup_labels, "stream": stream_labels},
+            "window_order": {
+                "warmup": warmup_years_fmt,
+                "stream": stream_years_fmt,
+                "warmup_periods": warmup_labels,
+                "stream_periods": stream_labels,
+                "all_years": all_years_fmt,
+            },
         }
 
     def _weighted_average(values: pd.Series, weights: Optional[pd.Series]) -> float:
@@ -1202,7 +1250,13 @@ def run_streaming_flow(
         "drift_events": drift_df,
         "metrics_by_year": metrics_by_year,
         "yearly_metrics": metrics_by_year,
-        "window_order": {"warmup": warmup_labels, "stream": stream_labels},
+        "window_order": {
+            "warmup": warmup_years_fmt,
+            "stream": stream_years_fmt,
+            "warmup_periods": warmup_labels,
+            "stream_periods": stream_labels,
+            "all_years": all_years_fmt,
+        },
     }
 
 
