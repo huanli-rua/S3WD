@@ -227,7 +227,8 @@ class SeasonalReservoir:
         rank: int,
         newest_same_month: Optional[pd.Period],
     ) -> np.ndarray:
-        months_diff = max(int(current_period - record.period), 1)
+        months_diff = _month_diff(current_period, record.period)
+        months_diff = max(months_diff, 1)
         w_time = math.exp(-self.time_decay * (months_diff - 1))
         month_gap = abs(int(current_period.month) - int(record.period.month))
         month_gap = min(month_gap, 12 - month_gap)
@@ -243,7 +244,7 @@ class SeasonalReservoir:
             and newest_same_month is not None
         ):
             # 越旧的同月样本按 keep_history_ratio 衰减
-            delta = int(newest_same_month - record.period)
+            delta = _month_diff(newest_same_month, record.period)
             keep_factor = self.keep_history_ratio ** max(0, delta)
         w_base = w_time * w_season * keep_factor * self.drift_multiplier
 
@@ -366,6 +367,14 @@ def _prepare_windows(X: pd.DataFrame, warmup_windows: int) -> WindowPlan:
 
 def _period_to_str(period: pd.Period) -> float:
     return year_month_to_float(int(period.year), int(period.month))
+
+
+def _month_diff(later: pd.Period, earlier: pd.Period) -> int:
+    """Compute the month difference between two ``pd.Period`` objects."""
+
+    year_gap = int(later.year) - int(earlier.year)
+    month_gap = int(later.month) - int(earlier.month)
+    return year_gap * 12 + month_gap
 
 
 def _build_figures(metrics_by_year: pd.DataFrame, output_dir: Path) -> None:
