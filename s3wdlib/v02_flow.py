@@ -274,6 +274,46 @@ def _calc_distribution_metrics(base_probs: np.ndarray, curr_probs: np.ndarray, b
     tv = float(0.5 * np.sum(np.abs(curr_ratio - base_ratio)))
     return psi, tv
 
+def refine_drift_level(
+    raw_level: str,
+    psi: float,
+    tv: float,
+    posrate_gap: float,
+    perf_drop: float,
+    drift_cfg: Dict[str, Any],
+) -> str:
+    """二次细化漂移级别：
+    - 对非常轻微的变化直接视为 NONE；
+    - 对中等变化降级为 S1，使 S1 成为最常见的漂移等级；
+    - 保持 S3 的判定严格，仅在 detect_drift 判为 S3 或外层强制触发时出现。
+    """
+    level = str(raw_level or "NONE").upper()
+
+    # 从配置中读取 gating 阈值，便于后续调优
+    gating_cfg = drift_cfg.get("gating", {}) if isinstance(drift_cfg, dict) else {}
+
+    psi_dead = float(gating_cfg.get("psi_deadzone", 0.05))
+    tv_dead = float(gating_cfg.get("tv_deadzone", 0.02))
+    pos_dead = float(gating_cfg.get("posrate_deadzone", 0.01))
+    perf_dead = float(gating_cfg.get("perf_deadzone", 0.005))
+
+    psi_strong = float(gating_cfg.get("psi_strong", 0.25))
+    tv_strong = float(gating_cfg.get("tv_strong", 0.15))
+    pos_strong = float(gating_cfg.get("posrate_strong", 0.05))
+    perf_strong = float(gating_cfg.get("perf_strong", 0.02))
+
+    # 1) 死区：变化在极小范围内，一律视为 NONE
+    if level in {"S1", "S2"}:
+        if (abs(psi) < psi_dead and abs(tv) < tv_dead and posrate_gap < pos_dead and perf_drop < perf_dead):
+            return "NONE"
+
+    # 2) 中等变化：原始判为 S2，但各项指标未达到“强漂移”阈值，则降级为 S1
+    if level == "S2":
+        if psi < psi_strong and tv < tv_strong and posrate_gap < pos_strong and perf_drop < perf_strong:
+            return "S1"
+
+    # 3) 其他情况保持原级别（包括 S3）
+    return level
 
 def _compute_similarity_block(
     X_block: pd.DataFrame,
@@ -334,25 +374,34 @@ def _ensure_year_month(X: pd.DataFrame, start_year: Optional[int] = None) -> pd.
 
 
 def _prepare_windows(X: pd.DataFrame, warmup_windows: int) -> WindowPlan:
-    periods = sorted(X["period"].unique())
-    years = sorted({int(p.year) for p in periods})
+    """根据 Year 序列划分 warmup 与 stream 窗口（按年份对半切）。
+
+    设计原则：
+    - 先从 X["Year"] 中提取有序年份序列；
+    - 默认使用「前一半年份」作为 warmup，后一半年份作为流式部分；
+    - 至少保留 1 年给 stream，避免所有年份都被划入 warmup。
+    warmup_windows 参数保留在签名中，当前实现中不参与 year 划分，仅用于兼容。
+    """
+    if "Year" not in X.columns or "period" not in X.columns:
+        raise ValueError("数据集中缺少 Year/period 列，无法按 year-month 窗口划分。")
+
+    years = sorted(int(y) for y in pd.Series(X["Year"]).dropna().unique())
     if not years:
-        raise RuntimeError("无法根据数据构建窗口年份序列。")
+        raise RuntimeError("无法根据数据构建年份序列。")
 
-    requested = max(0, int(warmup_windows))
-    if requested == 0:
-        requested = 12
-    warmup_year_count = max(1, math.ceil(requested / 12))
+    n_years = len(years)
+    if n_years < 2:
+        raise RuntimeError("年份数量不足以拆分 warmup 与 stream，请检查数据。")
 
-    if warmup_year_count >= len(years):
+    # 按年份对半划分：前一半年份用于 warmup，后一半年份用于 stream
+    warmup_year_count = max(1, n_years // 2)
+    if warmup_year_count >= n_years:
         warmup_years = years[:-1]
     else:
         warmup_years = years[:warmup_year_count]
-
-    if not warmup_years:
-        warmup_years = [years[0]]
-
     stream_years = [year for year in years if year not in warmup_years]
+
+    periods = sorted(X["period"].unique())
     warmup_periods = [p for p in periods if int(p.year) in warmup_years]
     stream_periods = [p for p in periods if int(p.year) in stream_years]
 
@@ -363,6 +412,7 @@ def _prepare_windows(X: pd.DataFrame, warmup_windows: int) -> WindowPlan:
         stream_years=stream_years,
         all_years=years,
     )
+
 
 
 def _period_to_str(period: pd.Period) -> float:
@@ -434,6 +484,9 @@ def _limit_grid_range(base_range: Tuple[float, float, float], center: Optional[f
         low = high = max(min(center, base_range[1]), base_range[0])
     return low, high, base_range[2]
 
+from sklearn.metrics import f1_score, balanced_accuracy_score
+
+
 
 def run_streaming_flow(
     cfg_path: str,
@@ -482,6 +535,15 @@ def run_streaming_flow(
     bucket_configure(cfg.get("BUCKET"))
     similarity_configure(cfg.get("SIMILARITY"))
     sim_cfg = similarity_current_config()
+
+# 新增：打印当前相似度配置，确认 cat_weights 生效
+    _logger.info(
+        "【SIM 配置】sigma=%.3f, combine=%s, mix_alpha=%.2f, cat_weights=%s",
+        sim_cfg.get("sigma", 0.5),
+        sim_cfg.get("combine", "product"),
+        sim_cfg.get("mix_alpha", 0.7),
+        sim_cfg.get("cat_weights", {}),
+    )
 
     data_path = data_dir / cfg["DATA"]["data_file"]
     X_raw, y = load_table_auto(
@@ -543,7 +605,47 @@ def run_streaming_flow(
     y_warm = y.loc[warmup_mask].reset_index(drop=True)
     buckets_warm = assign_buckets(X_warm)
 
+    # === 新增：统计 warmup 阶段桶情况，并导出为 Excel ===
+    # 构造一个包含 桶ID + 标签 的 DataFrame
+    bucket_df = pd.DataFrame(
+        {
+            "bucket_id": buckets_warm,
+            "label": y_warm.to_numpy(),  # 假定 1 为延误，0 为未延误
+        }
+    )
+
+    # 按桶统计样本数 / 正负类数 / 正类比例
+    bucket_stats = (
+        bucket_df.assign(is_pos=lambda df: df["label"] == 1)
+        .groupby("bucket_id")
+        .agg(
+            n_samples=("label", "size"),
+            n_pos=("is_pos", "sum"),
+        )
+        .reset_index()
+    )
+    bucket_stats["n_neg"] = bucket_stats["n_samples"] - bucket_stats["n_pos"]
+    bucket_stats["pos_rate"] = bucket_stats["n_pos"] / bucket_stats["n_samples"].clip(lower=1)
+
+    # 桶数量与平均桶大小日志
+    _logger.info(
+        "【warmup 桶汇总】桶数=%d，平均桶大小=%.1f，样本总数=%d",
+        int(len(bucket_stats)),
+        float(bucket_stats["n_samples"].mean()),
+        int(bucket_stats["n_samples"].sum()),
+    )
+
+    # 导出为 Excel，文件放在数据目录下
+    bucket_excel_path = "../targets/warmup_bucket_stats.xlsx"
+    try:
+        bucket_stats.to_excel(bucket_excel_path, index=False)
+        _logger.info("【warmup 桶汇总】桶明细已导出到：%s", bucket_excel_path)
+    except Exception as e:
+        _logger.warning("【warmup 桶汇总】导出 Excel 失败：%s", e)
+    # === 新增部分结束 ===
+
     cat_cols = list(categorical_candidates)
+
 
     gwb_cfg = cfg["GWB"]
     gwb_estimator = GWBProbEstimator(
@@ -682,6 +784,8 @@ def run_streaming_flow(
         "cat_weights": sim_cfg.get("cat_weights", {}),
         "combine": sim_cfg.get("combine", "product"),
         "mix_alpha": sim_cfg.get("mix_alpha", 0.7),
+        "baseline_window_count": 0,
+        "max_baseline_windows": int(cfg.get("DRIFT", {}).get("max_baseline_windows", 60)),
     }
 
     ema_alpha_coeff = cfg["SMOOTH"].get("ema_alpha", 0.6)
@@ -692,6 +796,7 @@ def run_streaming_flow(
     prediction_records: List[Dict[str, object]] = []
 
     for seq_idx, period in enumerate(stream_periods, start=1):
+        runtime_state["baseline_window_count"] = int(runtime_state.get("baseline_window_count", 0)) + 1
         unlockeds = reservoir.unlock_until(period)
         if unlockeds:
             keep_summary = {
@@ -752,6 +857,14 @@ def run_streaming_flow(
         X_block = X_enriched.loc[block_mask].reset_index(drop=True)
         y_block = y.loc[block_mask].reset_index(drop=True)
         buckets_block = assign_buckets(X_block)
+
+        # 新增：打印当前窗口的桶数（只日志，不导表）
+        _logger.info(
+            "【流式窗口】period=%s，样本数=%d，桶数=%d",
+            _period_to_str(period),
+            len(X_block),
+            len(np.unique(buckets_block)),
+        )
 
         def _recompute(sigma_value: float) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
             runtime_state["sigma"] = sigma_value
@@ -890,28 +1003,53 @@ def run_streaming_flow(
         _, _, stats = _recompute(float(runtime_state.get("sigma", 0.5)))
 
         psi_val, tv_val = _calc_distribution_metrics(
-            baseline_info["p_pos"], stats["P_block"]["p_pos"], baseline_info["bins"]
+            baseline_info['p_pos'], stats['P_block']['p_pos'], baseline_info['bins']
         )
+        # 当前窗口真实正类比例与相对 baseline 的差值
         posrate_curr = float(y_block.mean())
-        posrate_gap = abs(posrate_curr - baseline_info["posrate"])
-
+        posrate_gap = abs(posrate_curr - baseline_info['posrate'])
 
         stats_curr = {
-            "window_id": int(f"{period.year}{period.month:02d}"),
-            "psi": psi_val,
-            "tv": tv_val,
-            "posrate": posrate_gap,
-            "perf_drop": stats["perf_drop"],
+            'window_id': int(f"{period.year}{period.month:02d}"),
+            'psi': psi_val,
+            'tv': tv_val,
+            # detect_drift 中约定 posrate 为当前比例，差值通过 posrate_gap 提供
+            'posrate': posrate_curr,
+            'perf_drop': stats['perf_drop'],
+            'posrate_gap': posrate_gap,
         }
-        drift_level = detect_drift(stats_curr, baseline_info, cfg.get("DRIFT", {}))
+
+        raw_level = detect_drift(stats_curr, baseline_info, cfg.get('DRIFT', {}))
+        drift_level = refine_drift_level(
+            raw_level,
+            psi=psi_val,
+            tv=tv_val,
+            posrate_gap=posrate_gap,
+            perf_drop=stats['perf_drop'],
+            drift_cfg=cfg.get('DRIFT', {}),
+        )
+
+        # 基于时间的基线更新：超过最大窗口数仍未出现严重漂移，则触发一次 S3 级别的“软重置”
+        max_baseline_windows = int(runtime_state.get('max_baseline_windows', 0) or 0)
+        baseline_windows = int(runtime_state.get('baseline_window_count', 0) or 0)
+        forced_baseline = False
+        if max_baseline_windows > 0 and baseline_windows >= max_baseline_windows and drift_level in {'NONE', 'S1'}:
+            forced_baseline = True
+            drift_level = 'S3'
+            _logger.info(
+                '【漂移判级】已连续 %d 个窗口未更新基线，触发时间驱动的 S3 基线重置。',
+                baseline_windows,
+            )
+
         runtime_state = apply_actions(drift_level, runtime_state)
-        reservoir.set_keep_ratio(float(runtime_state.get("keep_history_ratio", reservoir.keep_history_ratio)))
+        reservoir.set_keep_ratio(float(runtime_state.get('keep_history_ratio', reservoir.keep_history_ratio)))
         reservoir.update_drift(drift_level)
 
         if drift_level == "S3":
             baseline_info["p_pos"] = stats["P_block"]["p_pos"]
             baseline_info["posrate"] = posrate_curr
             baseline_info["perf"] = stats["score"]
+            runtime_state["baseline_window_count"] = 0
 
         actions_taken: List[str] = []
         if runtime_state.get("redo_threshold"):
@@ -1061,6 +1199,7 @@ def run_streaming_flow(
                 "grid_feasible": int(grid_info.get("feasible_count", 0)),
             }
         )
+
 
         pred_region = np.where(stats["positive"], 1, np.where(stats["negative"], -1, 0))
         y_pred_label = np.where(pred_region == 1, 1, 0)
@@ -1259,4 +1398,3 @@ def run_streaming_flow(
 
 
 __all__ = ["run_streaming_flow"]
-

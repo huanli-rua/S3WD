@@ -66,9 +66,10 @@ PSO:
 
 # === v02 扩展分组：分桶 / 参考元组 / 相似度 / 阈值 / 平滑 / 漂移 / 开关 ===
 BUCKET:
-  keys: [UniqueCarrier, Origin, Dest, dep_hour]
-  min_bucket: 500
-  backoff: [[UniqueCarrier, Origin, Dest], [Origin, Dest], [Origin]]
+  keys: [Origin, dep_block]   # dep_block 是把 CRSDepTime 映射成几个大时间段
+  min_bucket: 50
+  backoff: [Origin]
+
 
 REF_TUPLE:
   topk_per_class: 256
@@ -78,10 +79,16 @@ REF_TUPLE:
 
 SIMILARITY:
   kernel: rbf
-  sigma: 0.5
-  cat_weights: {carrier: 0.4, origin: 0.2, dest: 0.2, dow: 0.1, month: 0.1}
+  sigma: 1
+  cat_weights: {
+    UniqueCarrier: 0.3,
+    Origin:        0.05,
+    Dest:          0.3,
+    DayOfWeek:     0.2,
+    Month:         0.15
+  }
   combine: product
-  mix_alpha: 0.7
+  mix_alpha: 0.6
 
 MEASURE:
   objective: expected_cost
@@ -119,8 +126,8 @@ SWITCH:
 FLOW:
   warmup_windows: 6
   recent_windows: 3
-  time_decay: 0.18
+  time_decay: 0.28
   seasonal_neighbor: 0.75
-  seasonal_other: 0.45
+  seasonal_other: 0.30
   weight_max: 2.5
-  history_cap: 12
+  history_cap: 8

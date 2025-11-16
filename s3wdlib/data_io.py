@@ -226,14 +226,58 @@ def augment_airline_features(df: pd.DataFrame) -> pd.DataFrame:
 
     if df is None or df.empty:
         return df
+
     enriched = df.copy()
+
+    # ========================
+    # 1）出发时间相关特征
+    # ========================
     if "CRSDepTime" in enriched.columns:
-        enriched["dep_hour"] = enriched["CRSDepTime"].apply(lambda v: _time_to_minutes(v) // 60)
+        # dep_hour：计划起飞小时（0~23）
+        enriched["dep_hour"] = enriched["CRSDepTime"].apply(
+            lambda v: _time_to_minutes(v) // 60
+        )
+
+        # dep_block：按业务时段划分的出发时段块（方案一）
+        # 0: 深夜/维护   00:00 - 04:59
+        # 1: 早高峰     05:00 - 09:59
+        # 2: 午间平峰   10:00 - 15:59
+        # 3: 晚高峰     16:00 - 19:59
+        # 4: 晚间末班   20:00 - 23:59
+        def _hour_to_block(h):
+            if pd.isna(h):
+                return -1  # 缺失值单独标记，不参与正常桶
+            h = int(h) % 24
+            if 0 <= h < 5:
+                return 0
+            elif 5 <= h < 10:
+                return 1
+            elif 10 <= h < 16:
+                return 2
+            elif 16 <= h < 20:
+                return 3
+            else:
+                return 4
+
+        enriched["dep_block"] = enriched["dep_hour"].apply(_hour_to_block).astype("int8")
+
+    # ========================
+    # 2）到达时间相关特征
+    # ========================
     if "CRSArrTime" in enriched.columns:
-        enriched["arr_hour"] = enriched["CRSArrTime"].apply(lambda v: _time_to_minutes(v) // 60)
+        # arr_hour：计划到达小时（0~23）
+        enriched["arr_hour"] = enriched["CRSArrTime"].apply(
+            lambda v: _time_to_minutes(v) // 60
+        )
+
+    # ========================
+    # 3）计划飞行时间（分钟）
+    # ========================
     if "CRSDepTime" in enriched.columns and "CRSArrTime" in enriched.columns:
         dep_min = enriched["CRSDepTime"].apply(_time_to_minutes)
         arr_min = enriched["CRSArrTime"].apply(_time_to_minutes)
-        block = (arr_min - dep_min) % (24 * 60)
+        block = (arr_min - dep_min) % (24 * 60)  # 考虑跨天
         enriched["block_time_min"] = block
+
     return enriched
+
